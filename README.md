@@ -4,9 +4,9 @@ A modern, colorful, full-stack YouTube video & audio downloader.
 
 **Features**
 - MP4 downloads: 1080p · 720p · 480p · 360p · 240p · 144p
-- High-quality MP3 audio extraction
+- High-quality audio extraction
 - Beautiful light / premium UI (violet · purple · pink · blue)
-- yt-dlp powered backend
+- Works on **Vercel** (pure JS — no yt-dlp)
 - Supabase-ready (auth + download history)
 - Next.js 14 · Tailwind · Framer Motion
 
@@ -32,18 +32,16 @@ Open [http://localhost:3000](http://localhost:3000).
 ## Requirements
 
 - Node.js 18+
-- `yt-dlp` available in PATH (the server uses it for metadata + downloading)
+- Works on **Vercel** and other serverless hosts (uses pure JS `youtubei.js` — no yt-dlp)
 
-Install yt-dlp:
-```bash
-# macOS
-brew install yt-dlp
+### Deploy on Vercel
 
-# Linux / pip
-pip install -U yt-dlp
+1. Push this repo to GitHub
+2. Import in [vercel.com](https://vercel.com) → Deploy
+3. No extra env vars required for basic download (optional: Supabase keys)
 
-# or follow https://github.com/yt-dlp/yt-dlp#installation
-```
+> Note: Downloads redirect to YouTube’s CDN. High-quality progressive MP4 is used when available.
+> True MP3 conversion / merged 1080p (video+audio separate streams) needs a self-hosted server with ffmpeg + yt-dlp.
 
 ## Project structure
 
@@ -53,16 +51,14 @@ vidora/
 │   ├── app/
 │   │   ├── api/
 │   │   │   ├── info/route.ts      # Extract video metadata
-│   │   │   └── download/route.ts  # Stream download
+│   │   │   └── download/route.ts  # Redirect to stream URL
 │   │   ├── layout.tsx
 │   │   ├── page.tsx
 │   │   └── globals.css
-│   ├── components/                # UI components
+│   ├── components/
 │   └── lib/
-│       ├── supabase.ts
-│       └── utils.ts
 ├── supabase/
-│   └── schema.sql                 # Database schema + RLS
+│   └── schema.sql
 └── ...
 ```
 
