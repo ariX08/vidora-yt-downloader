@@ -1,21 +1,82 @@
 import { NextRequest, NextResponse } from "next/server";
-import { exec } from "child_process";
-import { promisify } from "util";
-
-const execAsync = promisify(exec);
+import { spawn } from "child_process";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
 
+function runYtDlp(args: string[]): Promise<{ stdout: string; stderr: string; code: number }> {
+  return new Promise((resolve, reject) => {
+    // Prefer yt-dlp binary, fall back to python module
+    const candidates = ["yt-dlp", "python3 -m yt_dlp", "python -m yt_dlp"];
+
+    const tryNext = (index: number) => {
+      if (index >= candidates.length) {
+        reject(new Error(
+          "yt-dlp is not installed or not in PATH. " +
+          "Install it with: pip install -U yt-dlp  (or brew install yt-dlp)"
+        ));
+        return;
+      }
+
+      const cmd = candidates[index];
+      const parts = cmd.split(" ");
+      const bin = parts[0];
+      const binArgs = [...parts.slice(1), ...args];
+
+      const child = spawn(bin, binArgs, {
+        stdio: ["ignore", "pipe", "pipe"],
+        env: { ...process.env, PYTHONUNBUFFERED: "1" },
+      });
+
+      let stdout = "";
+      let stderr = "";
+
+      child.stdout.on("data", (chunk) => {
+        stdout += chunk.toString();
+      });
+      child.stderr.on("data", (chunk) => {
+        stderr += chunk.toString();
+      });
+
+      child.on("error", (err: NodeJS.ErrnoException) => {
+        // ENOENT = binary not found → try next candidate
+        if (err.code === "ENOENT") {
+          tryNext(index + 1);
+        } else {
+          reject(err);
+        }
+      });
+
+      child.on("close", (code) => {
+        if (code === 0 || stdout.trim()) {
+          resolve({ stdout, stderr, code: code ?? 1 });
+        } else if (index < candidates.length - 1 && /No such file|not found|ENOENT/i.test(stderr + (code === 127 ? "not found" : ""))) {
+          tryNext(index + 1);
+        } else {
+          resolve({ stdout, stderr, code: code ?? 1 });
+        }
+      });
+
+      // Timeout after 45s
+      setTimeout(() => {
+        child.kill("SIGKILL");
+        reject(new Error("yt-dlp timed out after 45 seconds"));
+      }, 45000);
+    };
+
+    tryNext(0);
+  });
+}
+
 export async function POST(req: NextRequest) {
   try {
-    const { url } = await req.json();
+    const body = await req.json();
+    const url = body?.url;
 
     if (!url || typeof url !== "string") {
       return NextResponse.json({ error: "URL is required" }, { status: 400 });
     }
 
-    // Basic validation
     if (!/(youtube\.com|youtu\.be)/i.test(url)) {
       return NextResponse.json(
         { error: "Please provide a valid YouTube URL" },
@@ -23,25 +84,58 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // Use yt-dlp to get JSON info (no download)
-    const command = `yt-dlp --dump-json --no-playlist --no-warnings "${url.replace(/"/g, '\\"')}"`;
+    const args = [
+      "--dump-json",
+      "--no-playlist",
+      "--no-warnings",
+      "--no-check-certificates",
+      url,
+    ];
 
-    const { stdout, stderr } = await execAsync(command, {
-      timeout: 45000,
-      maxBuffer: 10 * 1024 * 1024,
-    });
+    const { stdout, stderr, code } = await runYtDlp(args);
 
-    if (stderr && !stdout) {
-      console.error("yt-dlp stderr:", stderr);
+    if (code !== 0 || !stdout.trim()) {
+      console.error("yt-dlp failed:", { code, stderr: stderr.slice(0, 500) });
+
+      // Surface useful messages
+      const errText = (stderr || "").toLowerCase();
+      let message = "Could not retrieve video info. Please check the URL and try again.";
+
+      if (/private video|login required|sign in/i.test(errText)) {
+        message = "This video is private or requires login.";
+      } else if (/unavailable|not available|removed/i.test(errText)) {
+        message = "This video is unavailable or has been removed.";
+      } else if (/not installed|not in path|no module named|enoent/i.test(errText + message)) {
+        message =
+          "yt-dlp is not installed. Run: pip install -U yt-dlp  (or brew install yt-dlp) then restart the server.";
+      } else if (/http error 429|too many requests|rate.?limit/i.test(errText)) {
+        message = "YouTube rate-limited the request. Wait a minute and try again.";
+      } else if (/timed out/i.test(errText)) {
+        message = "Request timed out. Try again or check your network.";
+      } else if (stderr.trim()) {
+        // Show a short clean snippet of the real error
+        const clean = stderr
+          .split("\n")
+          .filter((l) => l.trim() && !l.includes("WARNING"))
+          .slice(0, 3)
+          .join(" ")
+          .slice(0, 200);
+        if (clean) message = clean;
+      }
+
+      return NextResponse.json({ error: message, detail: stderr.slice(0, 300) }, { status: 422 });
+    }
+
+    let info: any;
+    try {
+      info = JSON.parse(stdout);
+    } catch {
       return NextResponse.json(
-        { error: "Failed to fetch video information. The video may be private or unavailable." },
-        { status: 422 }
+        { error: "Failed to parse video information from yt-dlp." },
+        { status: 500 }
       );
     }
 
-    const info = JSON.parse(stdout);
-
-    // Extract useful formats
     const formats = (info.formats || [])
       .filter((f: any) => f.vcodec !== "none" || f.acodec !== "none")
       .map((f: any) => ({
@@ -58,16 +152,13 @@ export async function POST(req: NextRequest) {
         format_note: f.format_note,
       }));
 
-    // Preferred video qualities we support
     const supportedHeights = [1080, 720, 480, 360, 240, 144];
 
-    // Find best format for each height (prefer mp4)
     const videoOptions = supportedHeights
       .map((h) => {
         const candidates = formats.filter(
           (f: any) => f.height === h && f.vcodec !== "none"
         );
-        // Prefer progressive mp4, then others
         const best =
           candidates.find((f: any) => f.ext === "mp4" && f.acodec !== "none") ||
           candidates.find((f: any) => f.ext === "mp4") ||
@@ -85,7 +176,6 @@ export async function POST(req: NextRequest) {
       })
       .filter(Boolean);
 
-    // Audio options (best m4a / mp3)
     const audioFormats = formats
       .filter((f: any) => f.vcodec === "none" && f.acodec !== "none")
       .sort((a: any, b: any) => (b.tbr || 0) - (a.tbr || 0));
@@ -112,11 +202,33 @@ export async function POST(req: NextRequest) {
     return NextResponse.json(response);
   } catch (error: any) {
     console.error("Info API error:", error?.message || error);
-    const msg =
-      error?.message?.includes("Private video") ||
-      error?.message?.includes("unavailable")
-        ? "This video is private or unavailable."
-        : "Could not retrieve video info. Please check the URL and try again.";
-    return NextResponse.json({ error: msg }, { status: 500 });
+
+    const msg = error?.message || "";
+    if (/not installed|not in path|no module named/i.test(msg)) {
+      return NextResponse.json(
+        {
+          error:
+            "yt-dlp is not installed. Run: pip install -U yt-dlp  (or brew install yt-dlp) then restart the server.",
+        },
+        { status: 500 }
+      );
+    }
+    if (/timed out/i.test(msg)) {
+      return NextResponse.json(
+        { error: "Request timed out. Please try again." },
+        { status: 504 }
+      );
+    }
+    if (/private|unavailable/i.test(msg)) {
+      return NextResponse.json(
+        { error: "This video is private or unavailable." },
+        { status: 422 }
+      );
+    }
+
+    return NextResponse.json(
+      { error: "Could not retrieve video info. Please check the URL and try again." },
+      { status: 500 }
+    );
   }
 }
