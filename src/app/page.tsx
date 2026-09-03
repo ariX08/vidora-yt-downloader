@@ -9,6 +9,8 @@ import Features from "@/components/Features";
 import HowItWorks from "@/components/HowItWorks";
 import Footer from "@/components/Footer";
 
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || "";
+
 interface VideoInfo {
   id: string;
   title: string;
@@ -42,7 +44,7 @@ export default function HomePage() {
     setInfo(null);
 
     try {
-      const res = await fetch("/api/info", {
+      const res = await fetch(`${API_BASE}/api/info`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ url }),
@@ -76,7 +78,7 @@ export default function HomePage() {
         title: info.title,
       });
 
-      const downloadUrl = `/api/download?${params.toString()}`;
+      const downloadUrl = `${API_BASE}/api/download?${params.toString()}`;
 
       const a = document.createElement("a");
       a.href = downloadUrl;
