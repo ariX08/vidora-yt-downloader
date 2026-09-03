@@ -1,16 +1,36 @@
 import { NextRequest, NextResponse } from "next/server";
-import { spawn } from "child_process";
-import { Readable } from "stream";
+import { Innertube } from "youtubei.js";
 
 export const runtime = "nodejs";
-export const maxDuration = 300; // 5 minutes for large videos
+export const maxDuration = 30;
+
+function extractVideoId(url: string): string | null {
+  try {
+    const u = new URL(url);
+    if (u.hostname.includes("youtu.be")) {
+      return u.pathname.slice(1).split("/")[0] || null;
+    }
+    if (u.hostname.includes("youtube.com")) {
+      const v = u.searchParams.get("v");
+      if (v) return v;
+      const parts = u.pathname.split("/");
+      const shortsIdx = parts.indexOf("shorts");
+      if (shortsIdx >= 0 && parts[shortsIdx + 1]) return parts[shortsIdx + 1];
+      const embedIdx = parts.indexOf("embed");
+      if (embedIdx >= 0 && parts[embedIdx + 1]) return parts[embedIdx + 1];
+    }
+  } catch {
+    // ignore
+  }
+  const match = url.match(/(?:v=|\/)([0-9A-Za-z_-]{11})(?:[&?]|$)/);
+  return match ? match[1] : null;
+}
 
 export async function GET(req: NextRequest) {
   const searchParams = req.nextUrl.searchParams;
   const url = searchParams.get("url");
   const format = searchParams.get("format"); // mp4 | mp3
   const quality = searchParams.get("quality"); // 1080p, 720p, ..., mp3
-  const title = searchParams.get("title") || "vidora-download";
 
   if (!url || !format) {
     return NextResponse.json(
@@ -24,86 +44,76 @@ export async function GET(req: NextRequest) {
   }
 
   try {
-    // Build yt-dlp arguments
-    const args: string[] = [
-      "--no-playlist",
-      "--no-warnings",
-      "--newline",
-      "-o",
-      "-", // output to stdout
-    ];
-
-    if (format === "mp3") {
-      args.push("-x", "--audio-format", "mp3", "--audio-quality", "0");
-    } else {
-      // Video: select by height preference + best audio
-      const height = quality?.replace("p", "") || "720";
-      // Prefer mp4 with both video+audio, otherwise merge
-      args.push(
-        "-f",
-        `bestvideo[height<=${height}][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=${height}]+bestaudio/best[height<=${height}]/best`,
-        "--merge-output-format",
-        "mp4"
+    const videoId = extractVideoId(url);
+    if (!videoId) {
+      return NextResponse.json(
+        { error: "Could not extract video ID" },
+        { status: 400 }
       );
     }
 
-    args.push(url);
+    const yt = await Innertube.create();
+    const info = await yt.getInfo(videoId);
 
-    const safeTitle = title
-      .replace(/[^\w\s\-_.]/g, "")
-      .replace(/\s+/g, "_")
-      .slice(0, 80);
+    let streamUrl: string | undefined;
 
-    const filename =
-      format === "mp3"
-        ? `${safeTitle}.mp3`
-        : `${safeTitle}_${quality || "video"}.mp4`;
+    if (format === "mp3") {
+      const audioFormat = info.chooseFormat({
+        type: "audio",
+        quality: "best",
+      });
+      streamUrl = audioFormat?.deciphered_url || audioFormat?.url;
+    } else {
+      const height = parseInt(quality?.replace("p", "") || "720", 10);
 
-    const ytDlp = spawn("yt-dlp", args, {
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-
-    // Collect stderr for errors
-    let stderrData = "";
-    ytDlp.stderr.on("data", (chunk) => {
-      stderrData += chunk.toString();
-    });
-
-    // Create a Readable stream from stdout
-    const stream = Readable.from(ytDlp.stdout);
-
-    // Handle process errors
-    ytDlp.on("error", (err) => {
-      console.error("yt-dlp spawn error:", err);
-    });
-
-    ytDlp.on("close", (code) => {
-      if (code !== 0) {
-        console.error("yt-dlp exited with code", code, stderrData);
+      try {
+        const progressive = info.chooseFormat({
+          type: "video+audio",
+          quality: quality || "720p",
+        });
+        if (progressive && (progressive.height || 0) >= Math.min(height, 360)) {
+          streamUrl = progressive.deciphered_url || progressive.url;
+        }
+      } catch {
+        // fall through
       }
-    });
 
-    // Return streaming response
-    const headers = new Headers();
-    headers.set(
-      "Content-Disposition",
-      `attachment; filename="${filename}"`
-    );
-    headers.set(
-      "Content-Type",
-      format === "mp3" ? "audio/mpeg" : "video/mp4"
-    );
-    headers.set("Cache-Control", "no-cache");
+      if (!streamUrl) {
+        try {
+          const fmt = info.chooseFormat({
+            type: "video+audio",
+            quality: "best",
+          });
+          streamUrl = fmt?.deciphered_url || fmt?.url;
+        } catch {
+          const fmt = info.chooseFormat({
+            type: "video",
+            quality: quality || "best",
+          });
+          streamUrl = fmt?.deciphered_url || fmt?.url;
+        }
+      }
+    }
 
-    // @ts-ignore - NextResponse accepts Node streams in Node runtime
-    return new NextResponse(stream as any, {
-      status: 200,
-      headers,
-    });
+    if (!streamUrl) {
+      return NextResponse.json(
+        {
+          error:
+            "No suitable stream found for this quality. Try a lower resolution.",
+        },
+        { status: 422 }
+      );
+    }
+
+    // Redirect browser directly to YouTube CDN — works on Vercel
+    return NextResponse.redirect(streamUrl, 302);
   } catch (error: any) {
-    console.error("Download error:", error);
+    console.error("Download error:", error?.message || error);
     return NextResponse.json(
-      { error: "Download failed. Please try again." },
+      {
+        error:
+          "Download failed. The video may be restricted or the stream is unavailable.",
+      },
       { status: 500 }
     );
   }
